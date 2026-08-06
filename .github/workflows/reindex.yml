@@ -1,0 +1,338 @@
+name: Reindex
+
+# Rebuilds the signed APT index and publishes it to GitHub Pages.
+#
+# This repository holds no `.deb` files of its own. Each product publishes its
+# packages to its own GitHub Release, and this workflow collects the latest of
+# them, generates `Packages`/`Release`, signs `Release`, and deploys the result.
+# That keeps one signing key in one place — here — while every product's
+# release pipeline stays independent of the others.
+#
+# Triggered four ways:
+#  - `repository_dispatch` from a product's release workflow — the normal path,
+#    and the only one that reacts immediately;
+#  - `schedule`, a daily backstop: without it, a missing or expired
+#    APT_DISPATCH_TOKEN means a release publishes its .deb files while this site
+#    silently keeps serving the previous version, so the packages exist but
+#    `apt install` cannot see them and nothing says why. A day's delay is a much
+#    better failure than indefinite staleness;
+#  - `workflow_dispatch`, to rebuild by hand;
+#  - `push` to main, so a change to this workflow, products.json, the keys or the
+#    published landing page takes effect.
+#
+# Rebuilding is idempotent — the index is regenerated from whatever the current
+# latest releases are — so an extra run is never harmful, only wasted.
+on:
+  repository_dispatch:
+    types: [reindex]
+  schedule:
+    # 04:17 UTC — an odd minute, because GitHub queues the top of every hour
+    # heavily and scheduled runs there can be delayed by a long way.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      allow_empty:
+        description: >-
+          Publish even if no product has a release yet. For initial bring-up
+          only: the site then serves install.sh, the keyring and a valid but
+          empty index, so the documented entry point works before the first
+          release exists.
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    # Everything that changes what gets published. `index.html` and `CNAME` are
+    # in this list because they are part of the published site: without them a
+    # landing-page edit, or a change of custom domain, sat in the repository and
+    # never reached Pages.
+    paths:
+      - ".github/workflows/reindex.yml"
+      - "products.json"
+      - "keys/**"
+      - "index.html"
+      - "CNAME"
+
+# Only one deploy at a time, and never cancel one midway: a half-published
+# index is a repository every client fails to update from.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect the latest .deb from every product
+        env:
+          # The default token can read this org's public releases; it needs no
+          # extra scope, and deliberately has none.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/pool
+
+          # Every product listed in products.json contributes the assets of its
+          # most recent non-prerelease release. A product with no release yet is
+          # skipped with a note rather than failing the run — this repository has
+          # to be publishable before every product has shipped.
+          jq -r '.products[].repo' products.json | while read -r repo; do
+            echo "::group::$repo"
+            if ! tag="$(gh release list --repo "$repo" --exclude-drafts --exclude-pre-releases \
+                        --limit 1 --json tagName --jq '.[0].tagName // empty')"; then
+              echo "could not query releases for $repo — skipping"
+              echo "::endgroup::"
+              continue
+            fi
+            if [ -z "$tag" ]; then
+              echo "no published release for $repo yet — skipping"
+              echo "::endgroup::"
+              continue
+            fi
+            echo "taking $repo @ $tag"
+            before=$(find dist/pool -name '*.deb' | wc -l)
+            # Exits 0 with "no assets to download" when a release has no .deb —
+            # which is normal here, not every Stack256 product ships a Debian
+            # package (some are container images). Said out loud, because
+            # "taking docket @ v0.1.0" followed by silence reads as success.
+            gh release download "$tag" --repo "$repo" --pattern '*.deb' --dir dist/pool --clobber
+            after=$(find dist/pool -name '*.deb' | wc -l)
+            if [ "$before" -eq "$after" ]; then
+              echo "$repo @ $tag publishes no .deb assets — nothing to index for it"
+            else
+              echo "took $((after - before)) .deb file(s) from $repo @ $tag"
+            fi
+            echo "::endgroup::"
+          done
+
+          count=$(find dist/pool -name '*.deb' | wc -l | tr -d ' ')
+          echo "collected $count .deb file(s)"
+
+          # Publishing an empty index over a working one would make every
+          # package vanish — `apt install paco` would report it as simply not
+          # existing, with nothing to say why. So zero packages is a failure by
+          # default, and only allowed when explicitly asked for, which is the
+          # initial bring-up: before the first release there is nothing to
+          # replace, and the site still needs to serve install.sh and the
+          # keyring so the documented entry point is not a 404.
+          if [ "$count" -eq 0 ]; then
+            if [ "${{ inputs.allow_empty }}" = "true" ]; then
+              echo "::warning::No .deb files collected. Publishing install.sh, the keyring and an empty index because allow_empty was set. 'apt install paco' will not find a package until a product publishes a release."
+            else
+              echo "::error::No .deb files collected; refusing to publish an empty index over a working one. If this is the first publish and no product has released yet, re-run with allow_empty."
+              exit 1
+            fi
+          fi
+
+      - name: Generate Packages and Release
+        run: |
+          set -euo pipefail
+          cd dist
+          # `stable main` matches the source line install.sh writes:
+          #   deb [signed-by=...] https://apt.stack256.org stable main
+          mkdir -p dists/stable/main/binary-amd64 dists/stable/main/binary-arm64
+
+          for arch in amd64 arm64; do
+            # --arch keeps an amd64 index from listing arm64 packages: apt on a
+            # given machine only reads its own architecture's index, and a
+            # package listed in the wrong one is unresolvable.
+            dpkg-scanpackages --arch "$arch" pool /dev/null \
+              > "dists/stable/main/binary-$arch/Packages"
+            gzip -9c "dists/stable/main/binary-$arch/Packages" \
+              > "dists/stable/main/binary-$arch/Packages.gz"
+            echo "$arch: $(grep -c '^Package:' "dists/stable/main/binary-$arch/Packages" || true) package(s)"
+          done
+
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=Stack256 \
+            -o APT::FTPArchive::Release::Label=Stack256 \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Components=main \
+            -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+            release dists/stable > dists/stable/Release
+
+      - name: Sign Release
+        env:
+          SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::error::APT_SIGNING_KEY is not set. Clients pin this repository with"
+            echo "::error::signed-by=, so an unsigned index fails every apt update."
+            exit 1
+          fi
+
+          # A private GNUPGHOME under the runner's own workspace, mode 700, so
+          # the imported key is not left in the default keyring location.
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$SIGNING_KEY" | gpg --batch --quiet --import
+
+          keyid="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ -z "$keyid" ]; then
+            echo "::error::No secret key found after import — check APT_SIGNING_KEY holds an ASCII-armoured private key."
+            exit 1
+          fi
+
+          cd dist
+          # Both forms: InRelease (inline-signed, what modern apt prefers) and
+          # Release.gpg (detached, for older clients).
+          gpg --batch --yes --local-user "$keyid" --clearsign \
+            -o dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes --local-user "$keyid" --detach-sign --armor \
+            -o dists/stable/Release.gpg dists/stable/Release
+
+          # The public keyring clients install. Exported from the same key that
+          # just signed, so the two can never drift apart.
+          #
+          # `stack256-archive-keyring.gpg` is the canonical name: this key signs
+          # the index for every product, so naming it after one of them would
+          # read as Paco's key and become wrong the moment Paco is removed.
+          # `paco-archive-keyring.gpg` stays as a copy because paco v0.1.0's
+          # install.sh already fetches that path — removing it would break every
+          # host installed from that release. New releases use the canonical
+          # name; this copy can go once no supported release references it.
+          gpg --export > stack256-archive-keyring.gpg
+          cp stack256-archive-keyring.gpg paco-archive-keyring.gpg
+
+          gpgconf --kill all || true
+          rm -rf "$GNUPGHOME"
+
+      - name: Verify the index the way a client will
+        run: |
+          set -euo pipefail
+          cd dist
+          # Catch a broken publish here rather than on a customer's machine.
+          test -s dists/stable/InRelease
+          test -s dists/stable/Release.gpg
+          test -s stack256-archive-keyring.gpg
+          test -s paco-archive-keyring.gpg
+          for arch in amd64 arm64; do
+            # `-f`, not `-s`: an index with no packages yet is legitimately a
+            # zero-byte file, and apt reads it happily. Requiring non-empty
+            # here failed the very first publish, when no product had released.
+            test -f "dists/stable/main/binary-$arch/Packages"
+          done
+
+          # Verify the signature against the exported public key, in a scratch
+          # keyring — this is the check apt itself performs.
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --quiet --import stack256-archive-keyring.gpg
+          gpg --batch --verify dists/stable/InRelease
+          gpgconf --kill all || true
+          rm -rf "$GNUPGHOME"
+
+          # Every Filename: in the index must point at a file that exists, or
+          # apt 404s partway through an install.
+          #
+          # Collected to a file first rather than piped into a loop: under
+          # `pipefail` a grep that matches nothing exits 1 and would fail the
+          # whole step on an empty index, and a `while` on the right of a pipe
+          # runs in a subshell, so a failure recorded inside it could never be
+          # seen out here. Both were wrong in the first version of this step.
+          awk '/^Filename:/ {print $2}' dists/stable/main/binary-*/Packages \
+            | sort -u > /tmp/indexed-files
+          missing=0
+          while read -r f; do
+            [ -n "$f" ] || continue
+            if [ ! -f "$f" ]; then
+              echo "::error::indexed but missing: $f"
+              missing=1
+            fi
+          done < /tmp/indexed-files
+          [ "$missing" -eq 0 ]
+          echo "verified $(grep -c . /tmp/indexed-files || true) indexed file(s)"
+
+      # Installer scripts, one per product that declares one in products.json.
+      #
+      # Driven entirely by that file rather than naming a product here: this
+      # site serves every Stack256 product, so a hardcoded `Stack256org/paco`
+      # would make the whole reindex fail the day Paco is removed or renamed,
+      # taking every other product's packages down with it. Nothing in this
+      # workflow knows a product's name.
+      #
+      # Fetched from the product repository at the release tag being indexed, so
+      # an installer and the packages it installs come from one commit, and there
+      # is a single copy of each script rather than a stale second one here.
+      - name: Publish each product's installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Two products claiming the same published path would have one
+          # silently overwrite the other, and which one won would depend on
+          # array order. Refuse instead.
+          dupes="$(jq -r '[.products[] | select(.publish_as) | .publish_as]
+                          | group_by(.) | map(select(length > 1) | .[0]) | .[]' products.json)"
+          if [ -n "$dupes" ]; then
+            echo "::error::Two products claim the same publish_as: $dupes"
+            exit 1
+          fi
+
+          jq -c '.products[] | select(.installer and .publish_as)' products.json |
+            while read -r product; do
+              repo=$(printf '%s' "$product" | jq -r .repo)
+              installer=$(printf '%s' "$product" | jq -r .installer)
+              publish_as=$(printf '%s' "$product" | jq -r .publish_as)
+
+              # `publish_as` becomes a filesystem path under dist/, so it must
+              # not escape it.
+              case "$publish_as" in
+                /* | *..*) echo "::error::$repo: publish_as must be a relative path inside the site: $publish_as"; exit 1 ;;
+              esac
+
+              echo "::group::$repo -> /$publish_as"
+              ref="$(gh release list --repo "$repo" --exclude-drafts --exclude-pre-releases \
+                       --limit 1 --json tagName --jq '.[0].tagName // empty' 2>/dev/null || true)"
+              if [ -z "$ref" ]; then
+                ref=main
+                echo "no published release — taking $installer from main"
+              else
+                echo "taking $installer from $ref"
+              fi
+
+              mkdir -p "dist/$(dirname "$publish_as")"
+              if ! gh api "repos/$repo/contents/$installer?ref=$ref" --jq '.content' \
+                   | base64 -d > "dist/$publish_as"; then
+                echo "::error::could not fetch $installer from $repo@$ref"
+                exit 1
+              fi
+              chmod 0755 "dist/$publish_as"
+
+              # A truncated download or an error page saved under this name would
+              # not 404 — it would run on someone's machine.
+              test -s "dist/$publish_as"
+              head -1 "dist/$publish_as" | grep -q '^#!'
+              sh -n "dist/$publish_as"
+              echo "published /$publish_as from $ref ($(wc -c < "dist/$publish_as") bytes)"
+              echo "::endgroup::"
+            done
+
+      - name: Landing page and custom domain
+        run: |
+          cp index.html dist/index.html
+          cp CNAME dist/CNAME
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,15 @@
+# Build output — the index is generated in CI and published to Pages, never
+# committed. Committing it would let a stale index outlive the release it
+# described.
+/dist/
+
+# Never a private key, however it is named. The public half is committed
+# deliberately (keys/stack256-archive-keyring.asc); the private half belongs in
+# the APT_SIGNING_KEY secret.
+*.key
+*secret*.asc
+*private*.asc
+*.gpg
+!keys/*archive-keyring.asc
+
+.DS_Store
