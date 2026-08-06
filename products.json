@@ -1,8 +1,13 @@
 {
-  "$comment": "Every product served by apt.stack256.org. This file is the ONLY place a product is named — nothing in the workflow hardcodes one. Adding a product here is all that is needed for its packages, and optionally its installer script, to appear on the site. Removing it here removes them on the next run, with no other product affected and no leftover files, because the index and the site are rebuilt from scratch every time.",
+  "$comment": "Every product served by apt.stack256.org. This file is the ONLY place a product is named — nothing in the workflow hardcodes one. Adding a product here is all that is needed for its packages, its installer script, and its card on the landing page to appear. Removing it here removes them on the next run, with no other product affected and no leftover files, because the index and the site are rebuilt from scratch every time.",
+  "$comment_display": "`name`, `package` and `summary` are what the landing page renders. They are NOT used to build the index — a card is only shown for a product whose package is actually present in the generated Packages file, so the page cannot advertise something that failed to publish. `version` is deliberately absent: it is read from the built index at generate time, because a number written by hand here would be a second source of truth and would go stale the first time someone forgot it.",
   "products": [
     {
       "repo": "Stack256org/paco",
+      "name": "Paco",
+      "package": "paco",
+      "summary": "Describe a task and an agent works in an isolated sandbox until it is done — editing files, running the app, and opening a pull request you review.",
+      "homepage": "https://stack256.org/paco/",
       "$comment_installer": "Optional. `installer` is the path within the product's own repository; `publish_as` is the path it is served at on apt.stack256.org. Omit both for a product with no installer script. Two products must not claim the same `publish_as` — the workflow refuses rather than letting one silently overwrite another.",
       "installer": "install.sh",
       "publish_as": "install.sh"
