@@ -4,7 +4,7 @@ The signed APT repository for **every** Stack256 product, served from GitHub
 Pages at `https://apt.stack256.org`.
 
 ```text
-deb [signed-by=/usr/share/keyrings/stack256-archive-keyring.gpg] https://apt.stack256.org stable main
+deb [signed-by=/etc/apt/keyrings/stack256-archive-keyring.gpg] https://apt.stack256.org stable main
 ```
 
 One source line and one signing key, whatever a customer installs.

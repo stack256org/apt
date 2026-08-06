@@ -50,6 +50,7 @@ on:
       - "products.json"
       - "keys/**"
       - "index.html"
+      - "scripts/**"
       - "CNAME"
 
 # Only one deploy at a time, and never cancel one midway: a half-published
@@ -315,10 +316,22 @@ jobs:
               echo "::endgroup::"
             done
 
+      # The landing page's product list is generated from products.json crossed
+      # with the index this run just built, rather than copied. A hand-kept list
+      # is right until the day a second product ships and nobody edits the HTML,
+      # and it can advertise a package that failed to publish — which is worse
+      # than listing nothing, because `apt install` then fails on a name the
+      # site said was there. Generating it means the page can only ever name
+      # packages that are genuinely in the index, at the version that is
+      # genuinely downloadable.
       - name: Landing page and custom domain
         run: |
-          cp index.html dist/index.html
+          set -euo pipefail
+          python3 scripts/render-index.py dist
           cp CNAME dist/CNAME
+          # The page is the entry point for everyone who is not already sold, so
+          # a truncated or unwritten one is worth failing over.
+          test -s dist/index.html
 
       - uses: actions/upload-pages-artifact@v3
         with:
