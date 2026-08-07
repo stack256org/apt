@@ -8,9 +8,12 @@
       "package": "paco",
       "summary": "Describe a task and an agent works in an isolated sandbox until it is done — editing files, running the app, and opening a pull request you review.",
       "homepage": "https://stack256.org/paco/",
-      "$comment_installer": "Optional. `installer` is the path within the product's own repository; `publish_as` is the path it is served at on apt.stack256.org. Omit both for a product with no installer script. Two products must not claim the same `publish_as` — the workflow refuses rather than letting one silently overwrite another.",
+      "$comment_installer": "Optional. `installer` is the path within the product's own repository; `publish_as` is the path it is served at on apt.stack256.org. Omit both for a product with no installer script. Two products must not claim the same `publish_as`, or the same `legacy_publish_as` — the workflow refuses rather than letting one silently overwrite another.",
+      "$comment_namespacing": "Served under the product's own directory, not at the site root. A bare /install.sh reads as THE installer for this repository, which is wrong the moment a second product ships one — and there is only one root to fight over. /paco/install.sh scales to 256 of them and says whose it is.",
       "installer": "install.sh",
-      "publish_as": "install.sh"
+      "publish_as": "paco/install.sh",
+      "$comment_legacy": "Also served at the old root path, because paco v0.1.0 and v0.1.1 published a README telling people to curl it from there, and those sentences are now sitting in git history, in issues and in anyone's notes. Remove it once no supported release points at the root — the same reasoning as the paco-archive-keyring.gpg copy.",
+      "legacy_publish_as": "install.sh"
     }
   ]
 }

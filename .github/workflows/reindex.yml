@@ -270,10 +270,15 @@ jobs:
           # Two products claiming the same published path would have one
           # silently overwrite the other, and which one won would depend on
           # array order. Refuse instead.
-          dupes="$(jq -r '[.products[] | select(.publish_as) | .publish_as]
+          #
+          # Both path fields go into the same pool: a legacy alias collides just
+          # as destructively as a canonical path, and the root `install.sh` that
+          # Paco still answers on is exactly the kind of name a second product
+          # would reach for.
+          dupes="$(jq -r '[.products[] | (.publish_as, .legacy_publish_as) | select(.)]
                           | group_by(.) | map(select(length > 1) | .[0]) | .[]' products.json)"
           if [ -n "$dupes" ]; then
-            echo "::error::Two products claim the same publish_as: $dupes"
+            echo "::error::Two products claim the same published path: $dupes"
             exit 1
           fi
 
@@ -313,6 +318,21 @@ jobs:
               head -1 "dist/$publish_as" | grep -q '^#!'
               sh -n "dist/$publish_as"
               echo "published /$publish_as from $ref ($(wc -c < "dist/$publish_as") bytes)"
+
+              # An older published path, kept working because a released README
+              # already told people to curl it. Copied from the file just
+              # validated above rather than fetched again, so the two can never
+              # be different scripts.
+              legacy=$(printf '%s' "$product" | jq -r '.legacy_publish_as // empty')
+              if [ -n "$legacy" ]; then
+                case "$legacy" in
+                  /* | *..*) echo "::error::$repo: legacy_publish_as must be a relative path inside the site: $legacy"; exit 1 ;;
+                esac
+                mkdir -p "dist/$(dirname "$legacy")"
+                cp "dist/$publish_as" "dist/$legacy"
+                chmod 0755 "dist/$legacy"
+                echo "also published /$legacy (compatibility alias)"
+              fi
               echo "::endgroup::"
             done
 
